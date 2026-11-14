@@ -1,0 +1,484 @@
+
+from pathlib import Path
+import logging
+import threading
+
+import dnfile
+
+
+MAX_ASSEMBLY_SIZE = 100 * 1024 * 1024
+MAX_ASSEMBLIES = 2000
+MAX_REFERENCES_PER_ASSEMBLY = 500
+MAX_RESOURCES_PER_ASSEMBLY = 500
+
+# Prevent overlapping parser-warning capture operations.
+PARSER_WARNING_LOCK = threading.RLock()
+
+
+class DnfileWarningHandler(logging.Handler):
+    """Capture dnfile metadata decoding warnings."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+
+            if (
+                record.name.startswith("dnfile")
+                or "invalid compressed int" in message.lower()
+            ):
+                if message not in self.messages:
+                    self.messages.append(message)
+
+        except Exception:
+            pass
+
+
+def heap_value(item):
+    """Safely extract a value from a .NET metadata heap item."""
+    if item is None:
+        return None
+
+    value = getattr(item, "value", item)
+
+    if isinstance(value, bytes):
+        return value.hex()
+
+    return str(value)
+
+
+def table_rows(pe, table_name):
+    """Safely return rows from a .NET metadata table."""
+    try:
+        tables = pe.net.mdtables
+        table = getattr(tables, table_name, None)
+
+        if table is None:
+            return []
+
+        return list(table.rows or [])
+
+    except Exception:
+        return []
+
+
+def table_exists(pe, table_name):
+    """Check whether a metadata table is available."""
+    try:
+        table = getattr(pe.net.mdtables, table_name, None)
+        return table is not None
+    except Exception:
+        return False
+
+
+def make_finding(rule_id, title, severity, description, evidence, remediation):
+    return {
+        "rule_id": rule_id,
+        "title": title,
+        "severity": severity,
+        "category": "Managed Assembly Analysis",
+        "description": description,
+        "evidence": evidence,
+        "remediation": remediation
+    }
+
+
+
+def classify_assembly(path, root, assembly, metadata_tables):
+    """
+    Classify managed assemblies using metadata and bundle path.
+
+    Ownership classifications are heuristic and do not prove
+    whether an assembly is first-party or third-party.
+    """
+
+    relative_path = path.relative_to(root)
+    assembly_name = (assembly or {}).get("name") or ""
+    normalized_name = assembly_name.lower()
+
+    methoddef_count = metadata_tables.get("MethodDef")
+    resource_count = metadata_tables.get("ManifestResource")
+
+    is_resource_name = normalized_name.endswith(".resources")
+    has_resource_metadata = (
+        resource_count is not None and resource_count > 0
+    )
+    has_no_methods = (
+        methoddef_count is None or methoddef_count == 0
+    )
+
+    if is_resource_name and has_resource_metadata and has_no_methods:
+        if relative_path.parent != Path("."):
+            if normalized_name.startswith("finmobility."):
+                kind = "application_localized_resource"
+                confidence = "high"
+                reason = "Resource assembly name matches the application assembly family."
+            elif normalized_name.startswith("xamarin."):
+                kind = "framework_localized_resource"
+                confidence = "high"
+                reason = "Resource assembly name matches the Xamarin framework family."
+            else:
+                kind = "other_localized_resource"
+                confidence = "medium"
+                reason = "Resource-only assembly found in a nested bundle directory."
+
+            return {
+                "kind": kind,
+                "confidence": confidence,
+                "language_directory": relative_path.parent.name,
+                "reason": reason
+            }
+
+        return {
+            "kind": "resource_assembly_candidate",
+            "confidence": "medium",
+            "language_directory": None,
+            "reason": "Resource assembly identity and resource-only metadata characteristics."
+        }
+
+    if is_resource_name:
+        return {
+            "kind": "resource_assembly_candidate",
+            "confidence": "medium",
+            "language_directory": (
+                relative_path.parent.name
+                if relative_path.parent != Path(".")
+                else None
+            ),
+            "reason": "Assembly identity ends with .resources."
+        }
+
+    return {
+        "kind": "managed_assembly_unclassified",
+        "confidence": "low",
+        "language_directory": None,
+        "reason": (
+            "Managed assembly detected, but available metadata "
+            "does not establish whether it is application-owned "
+            "or a third-party dependency."
+        )
+    }
+
+    has_no_methods = (
+        methoddef_count is None or methoddef_count == 0
+    )
+
+    if is_resource_name and has_resource_metadata and has_no_methods:
+        if relative_path.parent != Path("."):
+            return {
+                "kind": "localized_resource_assembly_candidate",
+                "confidence": "high",
+                "language_directory": relative_path.parent.name,
+                "reason": (
+                    "Resource assembly identity, resource metadata, "
+                    "absence of methods, and nested bundle directory."
+                )
+            }
+
+        return {
+            "kind": "resource_assembly_candidate",
+            "confidence": "medium",
+            "language_directory": None,
+            "reason": (
+                "Resource assembly identity and resource-only "
+                "metadata characteristics."
+            )
+        }
+
+    if is_resource_name:
+        return {
+            "kind": "resource_assembly_candidate",
+            "confidence": "medium",
+            "language_directory": (
+                relative_path.parent.name
+                if relative_path.parent != Path(".")
+                else None
+            ),
+            "reason": "Assembly identity ends with .resources."
+        }
+
+    return {
+        "kind": "managed_assembly_unclassified",
+        "confidence": "low",
+        "language_directory": None,
+        "reason": (
+            "Managed assembly detected, but available metadata "
+            "does not establish whether it is application-owned "
+            "or a third-party dependency."
+        )
+    }
+
+def inspect_assembly(path: Path, root: Path) -> dict:
+    relative_path = str(path.relative_to(root))
+
+    result = {
+        "file": path.name,
+        "path": relative_path,
+        "file_size": path.stat().st_size,
+        "status": "completed",
+        "managed_assembly": False,
+        "assembly": None,
+        "assembly_classification": None,
+        "metadata_tables": {},
+        "parser_warnings": [],
+        "references": [],
+        "reference_count": 0,
+        "resources": [],
+        "resource_count": 0,
+        "findings": []
+    }
+
+    pe = None
+    warning_handler = DnfileWarningHandler()
+
+    with PARSER_WARNING_LOCK:
+        root_logger = logging.getLogger()
+        root_logger.addHandler(warning_handler)
+
+        try:
+            pe = dnfile.dnPE(str(path))
+
+            if pe is None or getattr(pe, "net", None) is None:
+                result["status"] = "not_managed"
+                return result
+
+            result["managed_assembly"] = True
+
+            # Inspect metadata tables without assuming all exist.
+            table_names = [
+                "Assembly",
+                "AssemblyRef",
+                "TypeDef",
+                "MethodDef",
+                "ManifestResource",
+                "File"
+            ]
+
+            for table_name in table_names:
+                if not table_exists(pe, table_name):
+                    result["metadata_tables"][table_name] = None
+                else:
+                    result["metadata_tables"][table_name] = len(
+                        table_rows(pe, table_name)
+                    )
+
+            # Assembly identity metadata.
+            assembly_rows = table_rows(pe, "Assembly")
+
+            if assembly_rows:
+                row = assembly_rows[0]
+
+                public_key = getattr(row, "PublicKey", None)
+                public_key_value = getattr(public_key, "value", b"")
+
+                if not isinstance(public_key_value, bytes):
+                    public_key_value = b""
+
+                result["assembly"] = {
+                    "name": heap_value(getattr(row, "Name", None)),
+                    "version": ".".join([
+                        str(getattr(row, "MajorVersion", 0)),
+                        str(getattr(row, "MinorVersion", 0)),
+                        str(getattr(row, "BuildNumber", 0)),
+                        str(getattr(row, "RevisionNumber", 0))
+                    ]),
+                    "culture": heap_value(getattr(row, "Culture", None)),
+                    "public_key_present": bool(public_key_value)
+                }
+
+            else:
+                result["findings"].append(make_finding(
+                    "IOS-DOTNET-001",
+                    "Managed assembly identity unavailable",
+                    "INFO",
+                    "The PE contains .NET metadata but no Assembly table entry was found.",
+                    {"file": path.name},
+                    "Review whether the module is an expected .NET netmodule."
+                ))
+
+            # Assembly references.
+            reference_rows = table_rows(pe, "AssemblyRef")
+
+            for row in reference_rows[:MAX_REFERENCES_PER_ASSEMBLY]:
+                result["references"].append({
+                    "name": heap_value(getattr(row, "Name", None)),
+                    "version": ".".join([
+                        str(getattr(row, "MajorVersion", 0)),
+                        str(getattr(row, "MinorVersion", 0)),
+                        str(getattr(row, "BuildNumber", 0)),
+                        str(getattr(row, "RevisionNumber", 0))
+                    ]),
+                    "culture": heap_value(getattr(row, "Culture", None))
+                })
+
+            result["reference_count"] = len(reference_rows)
+
+            if len(reference_rows) > MAX_REFERENCES_PER_ASSEMBLY:
+                result["findings"].append(make_finding(
+                    "IOS-DOTNET-002",
+                    "Assembly reference listing truncated",
+                    "INFO",
+                    "The assembly contains more references than the reporting limit.",
+                    {
+                        "reference_count": len(reference_rows),
+                        "reported_count": MAX_REFERENCES_PER_ASSEMBLY
+                    },
+                    "Review the complete dependency inventory if required."
+                ))
+
+            # Embedded resource metadata only.
+            # Resource contents are not extracted.
+            resource_rows = table_rows(pe, "ManifestResource")
+
+            for row in resource_rows[:MAX_RESOURCES_PER_ASSEMBLY]:
+                result["resources"].append({
+                    "name": heap_value(getattr(row, "Name", None)),
+                    "offset": getattr(row, "Offset", None),
+                    "flags": str(getattr(row, "Flags", ""))
+                })
+
+            result["resource_count"] = len(resource_rows)
+
+            if len(resource_rows) > MAX_RESOURCES_PER_ASSEMBLY:
+                result["findings"].append(make_finding(
+                    "IOS-DOTNET-003",
+                    "Resource listing truncated",
+                    "INFO",
+                    "The assembly contains more resources than the reporting limit.",
+                    {
+                        "resource_count": len(resource_rows),
+                        "reported_count": MAX_RESOURCES_PER_ASSEMBLY
+                    },
+                    "Review the complete resource inventory if required."
+                ))
+
+            # Assembly classification.
+            result["assembly_classification"] = classify_assembly(
+                path,
+                root,
+                result["assembly"],
+                result["metadata_tables"]
+            )
+
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = type(exc).__name__
+
+        finally:
+            if pe is not None:
+                try:
+                    pe.close()
+                except Exception:
+                    pass
+
+            root_logger.removeHandler(warning_handler)
+
+    result["parser_warnings"] = warning_handler.messages
+    result["parser_warning_count"] = len(warning_handler.messages)
+
+    if warning_handler.messages:
+        result["findings"].append(make_finding(
+            "IOS-DOTNET-004",
+            "Managed metadata parser warnings",
+            "INFO",
+            (
+                "The metadata parser reported decoding warnings. "
+                "This does not independently establish file corruption "
+                "or malicious behavior."
+            ),
+            {
+                "file": path.name,
+                "warning_count": len(warning_handler.messages),
+                "warnings": warning_handler.messages[:20]
+            },
+            (
+                "Review the affected assembly with an independent "
+                ".NET metadata inspection tool."
+            )
+        ))
+
+    result["findings_count"] = len(result["findings"])
+    return result
+
+
+def analyze_managed_assemblies(app_path: str) -> dict:
+    root = Path(app_path).resolve()
+
+    if not root.is_dir():
+        return {
+            "status": "error",
+            "error": "Application directory not found",
+            "assemblies": [],
+            "findings": []
+        }
+
+    assemblies = []
+    findings = []
+    scanned_files = 0
+    skipped_files = 0
+    managed_count = 0
+    errors = 0
+    resource_assembly_count = 0
+    parser_warning_count = 0
+
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+
+        if path.suffix.lower() != ".dll":
+            continue
+
+        if scanned_files >= MAX_ASSEMBLIES:
+            skipped_files += 1
+            continue
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            skipped_files += 1
+            continue
+
+        if size == 0 or size > MAX_ASSEMBLY_SIZE:
+            skipped_files += 1
+            continue
+
+        scanned_files += 1
+
+        result = inspect_assembly(path, root)
+        assemblies.append(result)
+
+        if result["managed_assembly"]:
+            managed_count += 1
+
+        classification = result.get("assembly_classification") or {}
+
+        if classification.get("kind") in {
+            "localized_resource_assembly_candidate",
+            "resource_assembly_candidate"
+        }:
+            resource_assembly_count += 1
+
+        parser_warning_count += result.get("parser_warning_count", 0)
+
+        if result["status"] == "error":
+            errors += 1
+
+        findings.extend(result.get("findings", []))
+
+    return {
+        "status": "completed",
+        "analysis_type": "static",
+        "dll_files_scanned": scanned_files,
+        "managed_assemblies_found": managed_count,
+        "resource_assembly_candidates": resource_assembly_count,
+        "unmanaged_or_non_dotnet_files": scanned_files - managed_count - errors,
+        "assembly_errors": errors,
+        "parser_warning_count": parser_warning_count,
+        "skipped_files": skipped_files,
+        "assemblies": assemblies,
+        "findings_count": len(findings),
+        "findings": findings
+    }

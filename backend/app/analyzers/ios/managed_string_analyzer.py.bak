@@ -1,0 +1,345 @@
+import ipaddress
+import re
+
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_FILES = 3000
+MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_FINDINGS = 1000
+MAX_FINDINGS_PER_FILE = 20
+
+SCAN_EXTENSIONS = {
+    ".dll", ".exe", ".config", ".json", ".xml",
+    ".plist", ".strings", ".txt", ".yaml", ".yml",
+    ".ini", ".properties", ".resources", ".dat"
+}
+
+ASCII_STRINGS = re.compile(rb"[\x20-\x7e]{5,}")
+UTF16_STRINGS = re.compile(rb"(?:[\x20-\x7e]\x00){5,}")
+
+URL_PATTERN = re.compile(
+    r"https?://[^\s\"'<>\\]{4,}",
+    re.IGNORECASE
+)
+
+IP_PATTERN = re.compile(
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])"
+)
+
+WEAK_CRYPTO_PATTERN = re.compile(
+    r"\b(?:MD5|SHA1|SHA-1|DES|3DES|TripleDES|RC2|RC4)\b",
+    re.IGNORECASE
+)
+
+TLS_BYPASS_PATTERNS = [
+    "DangerousAcceptAnyServerCertificateValidator",
+    "AllowUntrustedCertificate",
+    "TrustAllCertificates",
+    "ServerCertificateCustomValidationCallback",
+    "RemoteCertificateValidationCallback"
+]
+
+DEBUG_PATTERN = re.compile(
+    r"""(?i)(?:debug|isdebug|debugmode)\s*[:=]\s*["']?(?:true|1)\b"""
+)
+
+ENV_PATTERN = re.compile(
+    r"""(?i)(?:environment|aspnetcore_environment)\s*[:=]\s*["']?(?:development|staging|test)\b"""
+)
+
+
+def make_finding(rule_id, title, severity, description, evidence, remediation):
+    return {
+        "rule_id": rule_id,
+        "title": title,
+        "severity": severity,
+        "category": "Managed String and Configuration Analysis",
+        "description": description,
+        "evidence": evidence,
+        "remediation": remediation
+    }
+
+
+def extract_strings(content: bytes):
+    """Extract printable ASCII and UTF-16LE strings."""
+
+    for match in ASCII_STRINGS.finditer(content):
+        yield (
+            match.start(),
+            match.group().decode("ascii", errors="replace"),
+            "ASCII"
+        )
+
+    for match in UTF16_STRINGS.finditer(content):
+        try:
+            value = match.group().decode("utf-16le", errors="replace")
+            yield match.start(), value, "UTF-16LE"
+        except (UnicodeDecodeError, ValueError):
+            continue
+
+
+def analyze_string(value, offset, encoding, relative_path):
+    findings = []
+
+    def add(rule_id, title, description, remediation, extra=None):
+        evidence = {
+            "file": relative_path,
+            "byte_offset": offset,
+            "encoding": encoding
+        }
+
+        if extra:
+            evidence.update(extra)
+
+        findings.append(make_finding(
+            rule_id,
+            title,
+            "INFO",
+            description,
+            evidence,
+            remediation
+        ))
+
+    # URL discovery. Do not expose full URLs, paths or query strings.
+    for match in URL_PATTERN.finditer(value):
+        try:
+            parsed = urlsplit(match.group())
+
+            if parsed.scheme.lower() not in {"http", "https"}:
+                continue
+
+            if not parsed.hostname:
+                continue
+
+            scheme = parsed.scheme.lower()
+
+            add(
+                "IOS-STR-001",
+                "HTTP endpoint string discovered" if scheme == "http"
+                else "HTTPS endpoint string discovered",
+                "An application string contains an HTTP or HTTPS endpoint. "
+                "A string reference alone does not prove that the endpoint is used.",
+                "Review the endpoint and verify transport security and certificate validation.",
+                {"scheme": scheme}
+            )
+        except (ValueError, TypeError):
+            continue
+
+    # IPv4 discovery. Exclude special-purpose and non-routable addresses.
+    for match in IP_PATTERN.finditer(value):
+        try:
+            address = ipaddress.ip_address(match.group())
+
+            if not isinstance(address, ipaddress.IPv4Address):
+                continue
+
+            if (
+                address.is_loopback
+                or address.is_link_local
+                or address.is_multicast
+                or address.is_unspecified
+                or address.is_reserved
+            ):
+                continue
+
+            scope = "private" if address.is_private else "public"
+
+            add(
+                "IOS-STR-002",
+                "IPv4 address string discovered",
+                "An IPv4 address appears in an application string. "
+                "This may be an internal endpoint or an ordinary data value.",
+                "Review the address and determine whether it exposes internal infrastructure.",
+                {"address_scope": scope}
+            )
+
+        except ValueError:
+            continue
+
+    # Weak cryptographic algorithm indicators.
+    for match in WEAK_CRYPTO_PATTERN.finditer(value):
+        algorithm = match.group().upper()
+
+        add(
+            "IOS-STR-003",
+            "Cryptographic algorithm reference discovered",
+            "A string references a cryptographic algorithm that may be outdated "
+            "or weak. A string reference alone does not prove that the algorithm is used.",
+            "Review the associated code path and prefer modern, approved cryptographic algorithms.",
+            {"algorithm_indicator": algorithm}
+        )
+
+    # Certificate-validation API indicators.
+    lowered = value.lower()
+
+    for indicator in TLS_BYPASS_PATTERNS:
+        if indicator.lower() in lowered:
+            add(
+                "IOS-STR-004",
+                "Certificate-validation API indicator discovered",
+                "A string references an API or identifier associated with custom "
+                "certificate validation. Its presence does not prove that validation is bypassed.",
+                "Inspect the relevant implementation and ensure certificate and hostname validation remain enabled.",
+                {"indicator": indicator}
+            )
+
+    # Debug configuration indicators.
+    if DEBUG_PATTERN.search(value):
+        add(
+            "IOS-STR-005",
+            "Debug configuration indicator",
+            "A string resembles an enabled debug configuration.",
+            "Review build configuration and ensure production builds do not expose debug functionality."
+        )
+
+    # Non-production environment indicators.
+    if ENV_PATTERN.search(value):
+        add(
+            "IOS-STR-006",
+            "Non-production environment indicator",
+            "A string references a development, staging or test environment.",
+            "Verify that production builds do not contain unintended test configuration."
+        )
+
+    return findings
+
+
+def finding_dedupe_key(finding):
+    """
+    Deduplicate indicators within a file.
+
+    File offsets are deliberately excluded so repeated copies of the same
+    indicator do not create hundreds of findings.
+    """
+
+    evidence = finding.get("evidence", {})
+
+    indicator_fields = (
+        "scheme",
+        "address_scope",
+        "algorithm_indicator",
+        "indicator"
+    )
+
+    indicator = tuple(
+        (field, evidence[field])
+        for field in indicator_fields
+        if field in evidence
+    )
+
+    return finding.get("rule_id"), indicator
+
+
+def analyze_managed_strings(app_path: str) -> dict:
+    root = Path(app_path).resolve()
+
+    if not root.is_dir():
+        return {
+            "status": "error",
+            "error": "Application directory not found",
+            "findings": []
+        }
+
+    findings = []
+    scanned_files = 0
+    skipped_files = 0
+    total_bytes = 0
+    files_with_matches = 0
+    findings_truncated = False
+    stop_scan = False
+
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+
+        if path.suffix.lower() not in SCAN_EXTENSIONS:
+            continue
+
+        if scanned_files >= MAX_FILES:
+            skipped_files += 1
+            findings_truncated = True
+            continue
+
+        try:
+            size = path.stat().st_size
+
+            if size == 0:
+                skipped_files += 1
+                continue
+
+            if size > MAX_FILE_SIZE:
+                skipped_files += 1
+                findings_truncated = True
+                continue
+
+            if total_bytes + size > MAX_TOTAL_BYTES:
+                skipped_files += 1
+                findings_truncated = True
+                continue
+
+            content = path.read_bytes()
+
+        except OSError:
+            skipped_files += 1
+            continue
+
+        scanned_files += 1
+        total_bytes += len(content)
+
+        relative_path = str(path.relative_to(root))
+        file_seen = set()
+        file_finding_count = 0
+        file_had_matches = False
+
+        for offset, value, encoding in extract_strings(content):
+            matches = analyze_string(
+                value,
+                offset,
+                encoding,
+                relative_path
+            )
+
+            for finding in matches:
+                file_had_matches = True
+                key = finding_dedupe_key(finding)
+
+                if key in file_seen:
+                    continue
+
+                file_seen.add(key)
+
+                if file_finding_count >= MAX_FINDINGS_PER_FILE:
+                    findings_truncated = True
+                    continue
+
+                if len(findings) >= MAX_FINDINGS:
+                    findings_truncated = True
+                    stop_scan = True
+                    break
+
+                findings.append(finding)
+                file_finding_count += 1
+
+            if stop_scan:
+                break
+
+        if file_had_matches:
+            files_with_matches += 1
+
+        if stop_scan:
+            break
+
+    return {
+        "status": "completed",
+        "analysis_type": "static",
+        "files_scanned": scanned_files,
+        "files_skipped": skipped_files,
+        "total_bytes_scanned": total_bytes,
+        "files_with_matches": files_with_matches,
+        "findings_count": len(findings),
+        "findings_truncated": findings_truncated,
+        "findings": findings
+    }

@@ -1,0 +1,347 @@
+import json
+import plistlib
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .plist_analyzer import analyze_info_plist
+from .entitlements_analyzer import (
+    analyze_entitlements,
+    analyze_provisioning_profile
+)
+from .permissions_analyzer import analyze_permissions
+from .ats_analyzer import analyze_ats
+from .secrets_analyzer import analyze_secrets
+from .binary_analyzer import analyze_app_binaries
+from .framework_analyzer import analyze_frameworks
+from .managed_assembly_analyzer import analyze_managed_assemblies
+from .managed_string_analyzer import analyze_managed_strings
+
+
+SEVERITIES = [
+    "CRITICAL",
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+    "INFO"
+]
+
+
+def json_safe(value):
+    """Convert plist and analyzer values into JSON-safe values."""
+
+    if isinstance(value, bytes):
+        return "[binary data omitted]"
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        return {
+            str(key): json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    return str(value)
+
+
+def collect_entitlements(app_path: Path):
+    """Find packaged entitlement plist files."""
+
+    candidates = []
+
+    for path in app_path.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+
+        if (
+            path.name.endswith(".entitlements")
+            or path.name.endswith(".xcent")
+        ):
+            candidates.append(path)
+
+    return sorted(candidates)
+
+
+def get_bundle_identifier(info_plist: Path):
+    """Read the app bundle identifier without executing application code."""
+
+    try:
+        with info_plist.open("rb") as file:
+            data = plistlib.load(file)
+
+        if isinstance(data, dict):
+            value = data.get("CFBundleIdentifier")
+
+            if isinstance(value, str):
+                return value
+
+    except Exception:
+        pass
+
+    return None
+
+
+def count_severities(findings):
+    counts = {severity: 0 for severity in SEVERITIES}
+
+    for item in findings:
+        severity = str(item.get("severity", "INFO")).upper()
+
+        if severity not in counts:
+            severity = "INFO"
+
+        counts[severity] += 1
+
+    return counts
+
+
+def run_static_analysis(
+    app_path: str,
+    report_directory: str
+) -> dict:
+
+    app = Path(app_path).resolve()
+    report_dir = Path(report_directory).resolve()
+
+    if not app.is_dir() or app.is_symlink():
+        raise ValueError("Invalid application bundle directory")
+
+    info_plist = app / "Info.plist"
+
+    if info_plist.is_symlink() or not info_plist.is_file():
+        raise ValueError("Application Info.plist not found")
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    report_id = str(uuid.uuid4())
+    bundle_identifier = get_bundle_identifier(info_plist)
+
+    modules = {}
+    module_errors = []
+
+    def execute_module(name, function, *args):
+        try:
+            result = function(*args)
+
+            if not isinstance(result, dict):
+                raise ValueError("Analyzer returned an invalid result")
+
+            modules[name] = json_safe(result)
+
+            if result.get("status") == "error":
+                module_errors.append({
+                    "module": name,
+                    "error": result.get("error", "Analysis failed")
+                })
+
+        except Exception as exc:
+            modules[name] = {
+                "status": "error",
+                "error": type(exc).__name__
+            }
+
+            module_errors.append({
+                "module": name,
+                "error": type(exc).__name__
+            })
+
+    # 1. Application metadata
+    execute_module(
+        "info_plist",
+        analyze_info_plist,
+        str(info_plist)
+    )
+
+    # 2. Privacy permissions
+    execute_module(
+        "permissions",
+        analyze_permissions,
+        str(info_plist)
+    )
+
+    # 3. App Transport Security
+    execute_module(
+        "ats",
+        analyze_ats,
+        str(info_plist)
+    )
+
+    # 4. Hardcoded secrets
+    execute_module(
+        "secrets",
+        analyze_secrets,
+        str(app)
+    )
+
+    # 5. Mach-O binaries
+    execute_module(
+        "binaries",
+        analyze_app_binaries,
+        str(app)
+    )
+
+    # 6. Embedded frameworks
+    execute_module(
+        "frameworks",
+        analyze_frameworks,
+        str(app)
+    )
+
+    # 7. .NET / Xamarin managed assembly analysis
+    execute_module(
+        "managed_assemblies",
+        analyze_managed_assemblies,
+        str(app)
+    )
+
+    # 8. Managed string and configuration analysis
+    execute_module(
+        "managed_strings",
+        analyze_managed_strings,
+        str(app)
+    )
+
+    # 7. Packaged entitlement files
+    entitlement_files = collect_entitlements(app)
+    entitlement_results = []
+
+    for entitlement_file in entitlement_files:
+        try:
+            result = analyze_entitlements(str(entitlement_file))
+
+            entitlement_results.append({
+                "file": str(entitlement_file.relative_to(app)),
+                "result": json_safe(result)
+            })
+
+            if result.get("status") == "error":
+                module_errors.append({
+                    "module": "entitlements",
+                    "file": entitlement_file.name,
+                    "error": result.get("error", "Analysis failed")
+                })
+
+        except Exception as exc:
+            entitlement_results.append({
+                "file": str(entitlement_file.relative_to(app)),
+                "result": {
+                    "status": "error",
+                    "error": type(exc).__name__,
+                    "findings": []
+                }
+            })
+
+            module_errors.append({
+                "module": "entitlements",
+                "file": entitlement_file.name,
+                "error": type(exc).__name__
+            })
+
+    modules["entitlements"] = {
+        "status": (
+            "completed" if entitlement_files else "not_available"
+        ),
+        "files_found": len(entitlement_files),
+        "results": entitlement_results
+    }
+
+    # 8. Embedded provisioning profile
+    profile_path = app / "embedded.mobileprovision"
+
+    if profile_path.is_symlink():
+        modules["provisioning_profile"] = {
+            "status": "error",
+            "error": "Provisioning profile must not be a symbolic link",
+            "findings": []
+        }
+
+        module_errors.append({
+            "module": "provisioning_profile",
+            "error": "Symbolic link rejected"
+        })
+
+    elif profile_path.is_file():
+        execute_module(
+            "provisioning_profile",
+            analyze_provisioning_profile,
+            str(profile_path),
+            bundle_identifier
+        )
+
+    else:
+        modules["provisioning_profile"] = {
+            "status": "not_available",
+            "message": "No embedded.mobileprovision file found",
+            "findings": []
+        }
+
+    # Consolidate findings from all modules
+    findings = []
+
+    for module_name, result in modules.items():
+
+        if not isinstance(result, dict):
+            continue
+
+        if module_name == "entitlements":
+            for entitlement_result in result.get("results", []):
+                nested = entitlement_result.get("result", {})
+
+                if isinstance(nested, dict):
+                    findings.extend(nested.get("findings", []))
+
+            continue
+
+        findings.extend(result.get("findings", []))
+
+    findings = json_safe(findings)
+    severity_counts = count_severities(findings)
+
+    modules_completed = sum(
+        1
+        for item in modules.values()
+        if isinstance(item, dict)
+        and item.get("status") == "completed"
+    )
+
+    report = {
+        "product": "IVSL - iOS Virtual Security Lab",
+        "report_id": report_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_type": "STATIC_ONLY",
+        "application": modules.get("info_plist", {}).get(
+            "metadata", {}
+        ),
+        "summary": {
+            "total_findings": len(findings),
+            "severity_counts": severity_counts,
+            "modules_completed": modules_completed,
+            "modules_total": len(modules),
+            "modules_with_errors": len(module_errors)
+        },
+        "modules": modules,
+        "findings": findings,
+        "module_errors": module_errors
+    }
+
+    report_path = report_dir / f"{report_id}.json"
+
+    with report_path.open("x", encoding="utf-8") as file:
+        json.dump(
+            report,
+            file,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    report["report_file"] = str(report_path)
+
+    return report

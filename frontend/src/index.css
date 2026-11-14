@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #080b12;
+  color: #f8fafc;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+button {
+  cursor: pointer;
+}
+
+.phone-wallpaper {
+  background:
+    radial-gradient(ellipse at 25% 20%, #3979b9 0%, transparent 38%),
+    radial-gradient(ellipse at 80% 65%, #7543a7 0%, transparent 42%),
+    linear-gradient(145deg, #101d3d, #11152d 55%, #090d1b);
+}
+
+.phone-frame {
+  border: 5px solid #343943;
+  box-shadow: 0 30px 100px #000b, inset 0 0 0 1px #7775;
+}
+
+.glass {
+  background: #ffffff12;
+  border: 1px solid #ffffff20;
+  backdrop-filter: blur(18px);
+}
