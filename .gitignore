@@ -9,3 +9,8 @@ storage/reports/*
 storage/devices/*
 storage/snapshots/*
 logs/
+*.bak
+*.pre_*.bak
+test_demo.ipa
+test_ipa/
+storage/uploads/
